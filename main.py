@@ -358,8 +358,11 @@ def recon_run(authorization: str = Header(default="")):
             targets = logi_oids or [FRANKIE]
         mids = []
         for o in targets:
-            rr = send_card(t3, o, "物流对账 · %s %s" % (sup, result), lines, warn)
-            mids.append((rr.get("data", {}) or {}).get("message_id", "ERR"))
+            # 用聪哥1号发: resolve_logi/FRANKIE 的 open_id 均属聪哥1号命名空间
+            # (聪哥3号发会 99992361 open_id cross app)
+            rr = send_card(t1, o, "物流对账 · %s %s" % (sup, result), lines, warn)
+            mids.append((rr.get("data", {}) or {}).get("message_id")
+                        or ("ERR:" + json.dumps(rr, ensure_ascii=False)[:120]))
         out.append({"rid": rid, "sup": sup, "result": result, "sup_total": round(sup_total, 2),
                     "my_total": round(my_total, 2), "matched": n_match, "diff_rows": n_diff,
                     "mids": mids})
