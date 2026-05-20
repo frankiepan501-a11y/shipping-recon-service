@@ -23,6 +23,37 @@ LOGI_JOB = E("LOGI_JOB", "物流仓储主管")
 DRY_RUN = E("DRY_RUN", "1") == "1"
 BEARER = E("BEARER", "")
 FB = "https://open.feishu.cn"
+T_BILL = E("TBL_BILL", "tblF4e0SfakHGLS8")
+T_SUPPLIER_CFG = E("TBL_SUPPLIER_CFG", "")
+T_DECL = E("TBL_DECL", "")
+LINGXING_PROXY_URL = E("LINGXING_PROXY_URL", "")
+PROXY_TOKEN = E("PROXY_TOKEN", "")
+
+# 店铺+国家 → 领星 sid 映射 (procurement memory 同步)
+SHOP_SID = {
+    ("Fanlepu", "美国"): "3841", ("Fanlepu", "加拿大"): "3842", ("Fanlepu", "墨西哥"): "3843",
+    ("FUNLAB", "美国"): "1182", ("FUNLAB", "加拿大"): "1197", ("FUNLAB", "日本"): "1200",
+    ("FUNLAB", "墨西哥"): "2650",
+    ("Funlab Collection", "澳洲"): "1198", ("Funlab Collection", "澳大利亚"): "1198",
+    ("FunlabDirect", "英国"): "1192", ("FunlabDirect", "德国"): "1194",
+    ("FunlabDirect", "法国"): "1195", ("FunlabDirect", "西班牙"): "1196",
+    ("FunlabDirect", "意大利"): "1193",
+    ("pl-us", "美国"): "3621", ("pl-us", "加拿大"): "3622", ("pl-us", "墨西哥"): "3623",
+    ("YKTRICH", "美国"): "4339", ("YKTRICH", "加拿大"): "4340", ("YKTRICH", "墨西哥"): "4341",
+}
+
+
+def shop_to_sid(shop, country):
+    if not shop:
+        return None
+    # 精确匹配
+    if (shop, country) in SHOP_SID:
+        return SHOP_SID[(shop, country)]
+    # 前缀模糊匹配 (店铺名可能含后缀)
+    for (s, c), sid in SHOP_SID.items():
+        if shop.startswith(s) and country == c:
+            return sid
+    return None
 
 
 def _req(url, method="GET", body=None, headers=None, raw=False, timeout=120):
@@ -368,6 +399,185 @@ def recon_run(authorization: str = Header(default="")):
                     "mids": mids})
 
     return {"dry_run": DRY_RUN, "processed": len(out), "detail": out}
+
+
+def lingxing_call(method, path, params=None):
+    """走 lingxing-proxy on n8n (Zeabur 出站 IP 已白名单 + 内置签名)."""
+    if not LINGXING_PROXY_URL or not PROXY_TOKEN:
+        return {"code": -1, "message": "lingxing proxy not configured"}
+    body = {"method": method, "path": path, "params": params or {}}
+    return _req(LINGXING_PROXY_URL, "POST", body,
+                {"Authorization": "Bearer " + PROXY_TOKEN}, timeout=60)
+
+
+def lingxing_listings_by_sid(sid):
+    """拉某 sid 全部 listings (分页)."""
+    out, offset = [], 0
+    while True:
+        r = lingxing_call("POST", "/erp/sc/data/mws/listing",
+                          {"sid": sid, "length": 200, "offset": offset})
+        d = r.get("data") or []
+        if not d:
+            break
+        out.extend(d)
+        if len(d) < 200:
+            break
+        offset += 200
+        if offset >= 2000:
+            break
+    return out
+
+
+def lingxing_all_products():
+    """拉全部本地产品 (分页)."""
+    out, offset = [], 0
+    while True:
+        r = lingxing_call("POST", "/erp/sc/routing/data/local_inventory/productList",
+                          {"length": 200, "offset": offset})
+        d = r.get("data") or []
+        if not d:
+            break
+        out.extend(d)
+        if len(d) < 200:
+            break
+        offset += 200
+        if offset >= 2000:
+            break
+    return out
+
+
+def bitable_find(t1, table, key_field, key_value):
+    """飞书 bitable 按字段值精确匹配查 1 条 (in-mem filter)."""
+    if not key_value:
+        return None
+    for it in list_records(t1, table):
+        if nz(it["f"].get(key_field)).strip() == str(key_value).strip():
+            return it["f"]
+    return None
+
+
+@app.post("/h4/auto-fill")
+def h4_auto_fill(payload: dict, authorization: str = Header(default="")):
+    """H4 自动建开票要求明细骨架. WF-A 在主表推到「已发货待开票要求」时调用.
+    数据流: task → 领星查 supplier+采购价 → 飞书合规表 + 报关表 → 建明细(状态=待财务核对)."""
+    if BEARER and authorization != "Bearer " + BEARER:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    task_id = (payload or {}).get("task_record_id")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="missing task_record_id")
+    t1 = tok(APP1)
+    if not t1:
+        raise HTTPException(status_code=500, detail="feishu token fail")
+
+    # 1. 读 task
+    r = _req(FB + "/open-apis/bitable/v1/apps/%s/tables/%s/records/%s" % (BT, T_TASK, task_id),
+             "GET", None, {"Authorization": "Bearer " + t1})
+    tf = (r.get("data", {}) or {}).get("record", {}).get("fields", {})
+    if not tf:
+        return {"error": "task_not_found", "task_id": task_id}
+    if lk(tf.get("关联开票要求")):
+        return {"skip": "already_has_bill", "task_id": task_id}
+
+    fnsku = nz(tf.get("FNSKU")).strip()
+    pn = nz(tf.get("品名")).strip()
+    qty = num(tf.get("发货数量"))
+    ship_date = tf.get("实际发货时间") or 0
+    sn = nz(tf.get("货件编号")).strip()
+    shop = nz(tf.get("店铺")).strip()
+    country = nz(tf.get("国家")).strip()
+    if not fnsku or not pn:
+        return {"error": "missing_fnsku_or_pn", "task_id": task_id}
+
+    # 2. 领星: FNSKU → listing → local_sku → product → supplier/cg_price
+    sid = shop_to_sid(shop, country)
+    notes = ["H4自动建"]
+    if not sid:
+        return {"error": "no_sid_mapping", "shop": shop, "country": country,
+                "hint": "在 main.py SHOP_SID 加映射"}
+    listings = lingxing_listings_by_sid(sid)
+    listing = next((l for l in listings if (l.get("fnsku") or "").strip() == fnsku), None)
+    if not listing:
+        return {"error": "fnsku_not_in_listings", "fnsku": fnsku, "sid": sid,
+                "listing_count": len(listings)}
+    local_sku = (listing.get("local_sku") or "").strip()
+    if not local_sku:
+        return {"error": "no_local_sku", "fnsku": fnsku}
+
+    products = lingxing_all_products()
+    product = next((p for p in products if (p.get("sku") or "").strip() == local_sku), None)
+    if not product:
+        return {"error": "sku_not_in_products", "local_sku": local_sku}
+
+    cg_price = num(product.get("cg_price"))
+    supplier_name = ""
+    supplier_quote = product.get("supplier_quote") or []
+    if supplier_quote:
+        primary = next((q for q in supplier_quote if q.get("is_primary") == 1), supplier_quote[0])
+        supplier_name = (primary.get("supplier_name") or "").strip()
+        if num(primary.get("cg_price")) > 0:
+            cg_price = num(primary.get("cg_price"))
+    else:
+        notes.append("领星无 supplier_quote, 主供应商待补")
+
+    # 3. 飞书合规表查
+    inv_title = supplier_name or ""
+    tax_rate = ""
+    account_days = 7
+    if supplier_name and T_SUPPLIER_CFG:
+        cfg_row = bitable_find(t1, T_SUPPLIER_CFG, "供应商名称", supplier_name)
+        if cfg_row:
+            inv_title = nz(cfg_row.get("开票抬头")).strip() or supplier_name
+            tax_rate = nz(cfg_row.get("票面税率")).strip()
+            ad = int(num(cfg_row.get("账期天数")) or 0)
+            if ad > 0:
+                account_days = ad
+        else:
+            notes.append("供应商[%s]不在合规表" % supplier_name)
+    if not tax_rate:
+        notes.append("税率合规表未配")
+
+    # 4. 报关表查
+    invoice_item_name = pn
+    if T_DECL:
+        decl_row = bitable_find(t1, T_DECL, "品名", pn)
+        if decl_row:
+            v = nz(decl_row.get("开票项目名称")).strip()
+            if v:
+                invoice_item_name = v
+        else:
+            notes.append("品名[%s]不在报关表, 开票品名用原品名" % pn)
+
+    # 5. 计算
+    invoice_amount = round(qty * cg_price, 2)
+    bill_deadline = (int(ship_date) if ship_date else int(time.time() * 1000)) + account_days * 86400 * 1000
+    bill_id = sn + "-" + pn
+    if cg_price <= 0:
+        notes.append("采购价为0,请核对")
+
+    # 6. 建开票要求明细
+    fields = {
+        "开票要求编号": bill_id,
+        "关联发货任务": [task_id],
+        "开票品名": invoice_item_name,
+        "开票金额": invoice_amount,
+        "供应商": supplier_name,
+        "开票抬头": inv_title,
+        "税率": tax_rate,
+        "开票时限": bill_deadline,
+        "状态": "待财务核对",
+        "备注": " | ".join(notes),
+    }
+    cr = _req(FB + "/open-apis/bitable/v1/apps/%s/tables/%s/records" % (BT, T_BILL),
+              "POST", {"fields": fields}, {"Authorization": "Bearer " + t1})
+    new_rid = ((cr.get("data") or {}).get("record") or {}).get("record_id")
+    return {
+        "created": new_rid,
+        "task_id": task_id,
+        "fields": fields,
+        "notes": notes,
+        "lingxing_local_sku": local_sku,
+        "lingxing_supplier_count": len(supplier_quote),
+    }
 
 
 if __name__ == "__main__":
