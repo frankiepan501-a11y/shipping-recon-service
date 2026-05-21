@@ -548,11 +548,16 @@ def h4_auto_fill(payload: dict, authorization: str = Header(default="")):
             notes.append("品名[%s]不在报关表, 开票品名用原品名" % pn)
 
     # 5. 计算
-    invoice_amount = round(qty * cg_price, 2)
+    # 开票金额 = 数量 × 采购单价 × (1 + 税率) 含税总价
+    # cg_price 是领星里的不含税净价; 税率从合规表; 不含税净额=qty*cg_price; 含税=净额*(1+r)
+    tax_rate_num = num(tax_rate) if tax_rate else 0
+    invoice_amount = round(qty * cg_price * (1 + tax_rate_num), 2)
     bill_deadline = (int(ship_date) if ship_date else int(time.time() * 1000)) + account_days * 86400 * 1000
     bill_id = sn + "-" + pn
     if cg_price <= 0:
         notes.append("采购价为0,请核对")
+    if tax_rate_num <= 0:
+        notes.append("税率未配,开票金额按不含税净额算(=qty*cg_price)")
 
     # 6. 建开票要求明细
     fields = {
