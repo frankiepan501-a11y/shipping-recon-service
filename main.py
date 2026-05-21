@@ -446,6 +446,12 @@ def lingxing_all_products():
     return out
 
 
+def lingxing_product_info(sku):
+    """拉单个 SKU 详细信息 (含 declaration/clearance/物流属性)."""
+    r = lingxing_call("POST", "/erp/sc/data/local_inventory/productInfo", {"sku": sku})
+    return r.get("data") or {}
+
+
 def bitable_find(t1, table, key_field, key_value):
     """飞书 bitable 按字段值精确匹配查 1 条 (in-mem filter)."""
     if not key_value:
@@ -536,16 +542,19 @@ def h4_auto_fill(payload: dict, authorization: str = Header(default="")):
     if not tax_rate:
         notes.append("税率合规表未配")
 
-    # 4. 报关表查
+    # 4. 开票项目名称从领星 productInfo.declaration.customs_export_name 直接拉
+    #    (报关表的此字段已删, 领星=单一真相源; 工作流直接调 API 不在飞书表里冗余存)
     invoice_item_name = pn
-    if T_DECL:
-        decl_row = bitable_find(t1, T_DECL, "品名", pn)
-        if decl_row:
-            v = nz(decl_row.get("开票项目名称")).strip()
-            if v:
-                invoice_item_name = v
+    try:
+        pinfo = lingxing_product_info(local_sku)
+        decl = pinfo.get("declaration") or {}
+        cname = (decl.get("customs_export_name") or "").strip()
+        if cname:
+            invoice_item_name = cname
         else:
-            notes.append("品名[%s]不在报关表, 开票品名用原品名" % pn)
+            notes.append("领星[%s]报关-出口品名为空, 开票品名用原品名(请采购在领星报关信息补)" % local_sku)
+    except Exception as e:
+        notes.append("领星 productInfo 调用失败: %s, 开票品名用原品名" % str(e)[:50])
 
     # 5. 计算
     # 开票金额 = 数量 × 采购单价 × (1 + 税率) 含税总价
